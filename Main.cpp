@@ -57,6 +57,7 @@ namespace linalg {
 }
 
 namespace embree {
+	struct RTCORE_ALIGN(32) RTCValid8 { int data[8] = { -1,-1,-1,-1, -1,-1,-1,-1 }; };
 
 	struct Color { char r, g, b; };
 	struct Vertex { float x, y, z, r; }; // FIXME: rename to Vertex4f
@@ -157,6 +158,8 @@ namespace embree {
 		return mesh;
 	}
 
+	static const float3 lightDir = normalize(float3(-1, -1, -1));
+
 	float3 castRay(float3 rayOrg, float3 rayDir)
 	{
 		/* initialize ray */
@@ -179,7 +182,6 @@ namespace embree {
 		{
 			float3 diffuse = face_colors[ray.primID];
 			color = color + diffuse*0.5f;
-			float3 lightDir = normalize(float3(-1, -1, -1));
 
 			/* initialize shadow ray */
 			auto shadowOrg = (rayOrg + rayDir*ray.tfar);
@@ -189,8 +191,8 @@ namespace embree {
 			memcpy(shadow.dir, begin(shadowDir), sizeof(float3));
 			shadow.tnear = 0.001f;
 			shadow.tfar = INFINITY;
-			shadow.geomID = 1;
-			shadow.primID = 0;
+			shadow.geomID = RTC_INVALID_GEOMETRY_ID; // Set to 0 if occluded
+			shadow.primID = RTC_INVALID_GEOMETRY_ID;
 			shadow.mask = -1;
 			shadow.time = 0;
 
@@ -198,10 +200,78 @@ namespace embree {
 			rtcOccluded(g_scene, shadow);
 
 			/* add light contribution */
-			if (shadow.geomID)
+			if (shadow.geomID) {
 				color = color + diffuse*clamp(-dot(lightDir, normalize(float3(ray.Ng))), 0.0f, 1.0f);
+			}
 		}
 		return color;
+	}
+
+	void castRay8(const float3 rayOrg, const float3* rayDir, float3* colors)
+	{
+		/* initialize ray */
+		RTCRay8 ray;
+		for (auto i = 0; i < 8; ++i) {
+			ray.orgx[i] = rayOrg.x;
+			ray.orgy[i] = rayOrg.y;
+			ray.orgz[i] = rayOrg.z;
+			ray.dirx[i] = rayDir[i].x;
+			ray.diry[i] = rayDir[i].y;
+			ray.dirz[i] = rayDir[i].z;
+
+			ray.tnear[i] = 0.0f;
+			ray.tfar[i] = INFINITY;
+			ray.geomID[i] = RTC_INVALID_GEOMETRY_ID;
+			ray.primID[i] = RTC_INVALID_GEOMETRY_ID;
+			ray.mask[i] = -1;
+			ray.time[i] = 0;
+		}
+
+		/* intersect ray with scene */
+		RTCValid8 valid;
+		rtcIntersect8(valid.data, g_scene, ray);
+
+		/* initialize shadow ray */
+		RTCRay8 shadow;
+		for (auto i = 0; i < 8; ++i) {
+			valid.data[i] = (ray.geomID[i] != RTC_INVALID_GEOMETRY_ID)?-1:0;
+			if (valid.data[i]) {
+				auto shadowOrg = (rayOrg + rayDir[i] * ray.tfar[i]);
+				auto shadowDir = (lightDir*-1.0f);
+				shadow.orgx[i] = shadowOrg.x;
+				shadow.orgy[i] = shadowOrg.y;
+				shadow.orgz[i] = shadowOrg.z;
+				shadow.dirx[i] = shadowDir.x;
+				shadow.diry[i] = shadowDir.y;
+				shadow.dirz[i] = shadowDir.z;
+				shadow.tnear[i] = 0.001f;
+				shadow.tfar[i] = INFINITY;
+				shadow.geomID[i] = RTC_INVALID_GEOMETRY_ID; // Set to 0 if occluded
+				shadow.primID[i] = RTC_INVALID_GEOMETRY_ID;
+				shadow.mask[i] = -1;
+				shadow.time[i] = 0;
+			}
+		}
+
+		/* trace shadow ray */
+		rtcOccluded8(valid.data, g_scene, shadow);
+
+		/* shade pixels */
+		for (auto i = 0; i < 8; ++i) {
+			float3 color = float3(0.0f);
+
+			if (valid.data[i]) {
+				float3 diffuse = face_colors[ray.primID[i]];
+				color = color + diffuse*0.5f;
+
+				/* add light contribution */
+				if (shadow.geomID[i] == RTC_INVALID_GEOMETRY_ID) {
+					color = color + diffuse*clamp(-dot(lightDir, normalize(float3(ray.Ngx[i], ray.Ngy[i], ray.Ngz[i]))), 0.0f, 1.0f);
+				}
+			}
+
+			colors[i] = color;
+		}
 	}
 
 } // namespace embree
@@ -218,7 +288,7 @@ void main(int argc, char* argv[]) {
 
 	// Embree device and scene
 	g_device = rtcNewDevice(nullptr);
-	g_scene = rtcDeviceNewScene(g_device, RTC_SCENE_STATIC, RTC_INTERSECT1);
+	g_scene = rtcDeviceNewScene(g_device, RTC_SCENE_STATIC, RTC_INTERSECT1 | RTC_INTERSECT8);
 	addCube(g_scene);
 	addGroundPlane(g_scene);
 	rtcCommit(g_scene);
@@ -236,19 +306,46 @@ void main(int argc, char* argv[]) {
 	auto aspect = (float)width / height;
 	auto dx = 1.0f / width, dy = 1.0f / height;
 
-	// Render scene
-	auto startTime = chrono::high_resolution_clock::now();
-	parallel_for(size_t(0), size_t(width*height), [&](size_t i) {
-		auto x = (i%width);
-		auto y = (i/width);
-		auto u = (2 * (x * dx) - 1);
-		auto v = (2 * (y * dy) - 1);
-		auto d = mul(viewMatrixInverse, float3(u * aspect, -v, z)) - from;
-		auto c = castRay(from, normalize(d));
-		pixels[i] = color(c);
-	});
-	auto endTime = chrono::high_resolution_clock::now();
-	cout << "Render time = " << chrono::duration_cast<chrono::milliseconds>(endTime - startTime).count() << endl;
+	// Render scene using single rays
+	{
+		auto startTime = chrono::high_resolution_clock::now();
+		parallel_for(size_t(0), size_t(width*height), [&](size_t i) {
+			auto x = (i%width);
+			auto y = (i / width);
+			auto u = (2 * (x * dx) - 1);
+			auto v = (2 * (y * dy) - 1);
+			auto d = mul(viewMatrixInverse, float3(u * aspect, -v, z)) - from;
+			auto c = castRay(from, normalize(d));
+			pixels[i] = color(c);
+		});
+		auto endTime = chrono::high_resolution_clock::now();
+		cout << "Render time (1) = " << chrono::duration_cast<chrono::milliseconds>(endTime - startTime).count() << endl;
+	}
+
+	// Render scene using 8 ray packets
+	{
+		auto startTime = chrono::high_resolution_clock::now();
+		parallel_for(size_t(0), size_t(width*height / 8), [&](size_t _i) {
+			float3 rays[8];
+			for (auto r = 0; r < 8; ++r) {
+				auto i = (_i * 8) + r;
+				auto x = (i%width);
+				auto y = (i / width);
+				auto u = (2 * (x * dx) - 1);
+				auto v = (2 * (y * dy) - 1);
+				auto d = mul(viewMatrixInverse, float3(u * aspect, -v, z)) - from;
+				rays[r] = normalize(d);
+			}
+			float3 colors[8];
+			castRay8(from, rays, colors);
+			for (auto r = 0; r < 8; ++r) {
+				auto i = (_i * 8) + r;
+				pixels[i] = color(colors[r]);
+			}
+		});
+		auto endTime = chrono::high_resolution_clock::now();
+		cout << "Render time (8) = " << chrono::duration_cast<chrono::milliseconds>(endTime - startTime).count() << endl;
+	}
 
 	// Free device and scene
 	rtcDeleteScene(g_scene); g_scene = nullptr;
