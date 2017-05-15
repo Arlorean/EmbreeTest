@@ -1,6 +1,8 @@
 # EmbreeTest
 This is a simple standalone version of the [Intel Embree](https://github.com/embree/embree) [triangle_geometry tutorial](https://github.com/embree/embree/blob/master/tutorials/triangle_geometry/triangle_geometry_device.cpp).
 
+![](Result.png?raw=true)
+
 Install the [Intel Embree v2.15.0 x64 Windows binary distribution](https://embree.github.io/downloads.html).
 
 Build with Visual Studio 2017.
